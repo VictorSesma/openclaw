@@ -1,6 +1,7 @@
 /** Lifecycle-owned auth/model discovery snapshots for agent runs. */
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { readOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getPreparedSharedAuthStoreOwnership } from "./auth-profiles/path-resolve.js";
 import { registerRuntimeAuthProfileStoreMutationListener } from "./auth-profiles/runtime-snapshots.js";
@@ -738,9 +739,10 @@ function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): voi
   };
   // Auth revocation fences its affected owners immediately; publication must wait for the
   // plugin reservation to settle without occupying the queue needed by replacement recovery.
-  const publication = modelRuntimeDrain.runAfter(publicationQueue, publish);
+  // Publication outlives the emitter's SQLite readers; the runtime owns its reads and cleanup.
+  const job = readOnlyWorkerScope.exit(() => modelRuntimeDrain.runAfter(publicationQueue, publish));
   notifyPreparedModelRuntimePublication({ phase: "invalidated" });
-  void publication.catch((error: unknown) => {
+  void job.catch((error: unknown) => {
     if (!authPublication.isCurrent(transaction)) {
       return;
     }

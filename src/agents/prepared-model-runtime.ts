@@ -690,19 +690,15 @@ async function drainPendingAuthMutations(
 }
 
 function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): void {
-  const normalizedEvent = {
-    ...event,
-    agentDir: normalizeOptionalDir(event.agentDir),
-  };
   const { invalidatedOwners, invalidatedConfiguredAgentIds } =
-    invalidatePreparedModelRuntimeOwnersForAuthMutation(owners, normalizedEvent);
+    invalidatePreparedModelRuntimeOwnersForAuthMutation(owners, event);
   if (invalidatedOwners.length === 0) {
     // A first owner reads the already-published auth snapshot while it builds. Replaying an earlier
     // mutation would immediately stale that initial generation even though no prior owner existed.
     return;
   }
   replyDispatchPublication.remove(invalidatedConfiguredAgentIds);
-  const transaction = authPublication.enqueue(invalidatedOwners, normalizedEvent.profileSetChanged);
+  const transaction = authPublication.enqueue(invalidatedOwners, event.profileSetChanged);
   if (getBlockingReplacement()) {
     // The active config transaction drains this event before its atomic dispatch commit. Retire
     // the superseded build gate; queuing another task would make this commit depend on future work.

@@ -25,6 +25,7 @@ import { selectProfileAccessEntries } from "./user-profile-github-identity.js";
 import {
   profileCatalogPath,
   projectHasMultipleSessionSharingIdentities,
+  projectUserProfileDisplayFacts,
   resolveUserProfileReferenceInCatalog,
 } from "./user-profile-identity.read.js";
 import type { UserProfileEmailBindingChange } from "./user-profile-mutation.js";
@@ -32,6 +33,7 @@ import {
   applyUserProfileEmailBinding,
   bindPreparedUserProfileIdentity,
   projectUserProfileDisplay,
+  projectUserProfileSnapshot,
   projectCatalogUserProfileIdentity,
   resolveCatalogProfile,
   toUserProfile,
@@ -161,25 +163,26 @@ export function readResidentGatewayOwnerProfile(pathname: string) {
   return toUserProfile({ ...owner, created_at: owner.gatewayOwnerCreatedAt });
 }
 
+/** Existing authenticated email bindings use the same write-through catalog as role checks. */
+export function readResidentUserProfileForEmail(email: string, pathname: string) {
+  const catalog = profileCatalogs.get(pathname);
+  const binding = catalog?.valid && profileBindings.get(catalog.rows)?.byEmail.get(email);
+  if (!binding) {
+    return undefined;
+  }
+  catalog.assertCurrent?.(binding.profileId);
+  const profile = resolveCatalogProfile(catalog.rows, binding.profileId);
+  if (profile) {
+    catalog.assertCurrent?.(profile.id);
+    return toUserProfile(profile);
+  }
+  return undefined;
+}
+
 /** Sharing pickers consume the session projection's committed display catalog. */
 export function listResidentUserProfileDisplayFacts(options: OpenClawStateDatabaseOptions = {}) {
-  const catalog = profileCatalogs.get(profileCatalogPath(options));
-  const bindings = catalog && profileBindings.get(catalog.rows);
-  if (!catalog?.valid || !bindings) {
-    throw new Error("User profile catalog is not ready");
-  }
-  return [...catalog.rows.values()].map((profile) => ({
-    id: profile.id,
-    label:
-      profile.display_name?.trim() ||
-      profile.githubLogin ||
-      [...(bindings.emailsByProfile.get(profile.id) ?? [])].toSorted((left, right) =>
-        Buffer.compare(Buffer.from(left), Buffer.from(right)),
-      )[0] ||
-      profile.id,
-    hasAvatar: profile.has_avatar === 1,
-    updatedAt: profile.updated_at,
-  }));
+  const rows = requireResidentProfileCatalog(options);
+  return projectUserProfileDisplayFacts(rows, profileBindings.get(rows)!);
 }
 
 /** Pass the prepared absolute database path for allocation-free checks of live owner state. */
@@ -638,6 +641,22 @@ export async function prepareUserProfileCatalog(options: OpenClawStateDatabaseOp
   };
 }
 
+/** Lists share committed profile facts rather than reserving the shared-state writer. */
+export async function readUserProfileSnapshot(
+  githubAccountIds?: readonly number[],
+  options: OpenClawStateDatabaseOptions = {},
+) {
+  const catalog = await acquireUserProfileCatalog(options);
+  try {
+    for (const row of catalog.rows.values()) {
+      catalog.assertCurrent(row.id);
+    }
+    return projectUserProfileSnapshot(catalog.rows, catalog.bindings, githubAccountIds);
+  } finally {
+    catalog.release();
+  }
+}
+
 /** Prepare once off-thread; execution reads only committed facts retained by this owner. */
 export async function prepareUserProfileIdentity(
   profileId: string,
@@ -700,6 +719,22 @@ export function getResidentUserProfileDisplay(
     throw new UserProfileNotFoundError(profileId);
   }
   return projectUserProfileDisplay(profile);
+}
+
+/** Transfer display facts and aliases at the owner's publication revision, never authority. */
+export function captureResidentUserProfileDisplaySnapshot(
+  options: OpenClawStateDatabaseOptions = {},
+) {
+  const rows = requireResidentProfileCatalog(options);
+  return {
+    revision: readUserProfileVersion(),
+    displays: new Map(
+      [...rows.keys()].map((id) => [
+        id,
+        projectUserProfileDisplay(resolveCatalogProfile(rows, id)!),
+      ]),
+    ),
+  };
 }
 
 /** Activity references are display navigation, never authentication identifiers. */

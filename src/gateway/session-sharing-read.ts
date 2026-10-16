@@ -19,7 +19,11 @@ import {
 } from "./operator-role-policy.js";
 import { authenticatedProfileUnavailableError } from "./server-methods/gateway-client-identity.js";
 import type { GatewayClient, SessionMutationAuthorization } from "./server-methods/types.js";
-import { isSessionCreatorProfile, prepareSessionCreatorProfile } from "./session-creator.js";
+import { prepareSessionCreatorProfile } from "./session-creator.js";
+import {
+  createProfileSessionEntryFilter,
+  type SessionListVisibility,
+} from "./session-list-visibility.js";
 import {
   SessionMutationAuthorizationChangedError,
   SessionSharingProfileFactsChangedError,
@@ -37,23 +41,7 @@ import {
 } from "./session-sharing-policy.js";
 import type { GatewaySessionStoreSelection } from "./session-utils-store-retained.js";
 
-function sharingSnapshot(
-  target: SessionSharingTarget | null,
-  sessionKey: string,
-): {
-  createdActor?: SessionEntry["createdActor"];
-  incognito: boolean;
-  visibility: ReturnType<typeof resolveSessionVisibility>;
-} {
-  // Deleted rows fail closed; their unscoped catalog invalidation still refreshes readers.
-  return {
-    visibility: target ? resolveSessionVisibility(target.entry) : "draft",
-    incognito: target
-      ? target.entry.incognito === true || isIncognitoSessionKey(target.canonicalKey)
-      : isIncognitoSessionKey(sessionKey),
-    ...(target ? { createdActor: target.entry.createdActor } : {}),
-  };
-}
+export { createProfileSessionEntryFilter } from "./session-list-visibility.js";
 
 export function canReceiveSessionEvent(params: {
   cfg: OpenClawConfig;
@@ -92,35 +80,32 @@ export function canReceiveSessionEvent(params: {
   }
   const sharing = params.prepared.sharing;
   const hidesForeignSessions = sharing.sessionCap === "none";
-  const resolveTarget = (sessionKey: string) => params.prepared.target(sessionKey, params.agentId);
-  const visible = sessionKeys.every((sessionKey) => {
-    const snapshot = sharingSnapshot(resolveTarget(sessionKey), sessionKey);
-    const isCreator = sharing.isCreator(snapshot.createdActor);
-    if (snapshot.incognito || (hidesForeignSessions && !isCreator)) {
-      return false;
-    }
-    if (snapshot.visibility !== "draft" || isCreator) {
-      return true;
-    }
-    if (event !== "session.typing") {
-      return false;
-    }
-    const typingTarget = resolveTarget(sessionKey);
-    return typingTarget !== null && canManageSessionSharing(sharing.roleForTarget(typingTarget));
-  });
-  if (!visible || event !== "session.suggestion") {
-    return visible;
-  }
   const authorId =
-    params.payload && typeof params.payload === "object"
+    event === "session.suggestion" && params.payload && typeof params.payload === "object"
       ? (params.payload as { suggestion?: { author?: { id?: unknown } } }).suggestion?.author?.id // SAFETY: publishSuggestion emits SessionSuggestionEvent; this only reads the optional author id.
       : undefined;
-  if (authorId === identity.id) {
-    return true;
-  }
   return sessionKeys.every((sessionKey) => {
-    const target = resolveTarget(sessionKey);
-    return target !== null && sharing.roleForTarget(target) !== "viewer";
+    const target = params.prepared.target(sessionKey, params.agentId);
+    // Deleted rows fail closed; their unscoped catalog invalidation still refreshes readers.
+    if (!target) {
+      return false;
+    }
+    const isCreator = sharing.isCreator(target.entry.createdActor);
+    if (
+      target.entry.incognito === true ||
+      isIncognitoSessionKey(target.canonicalKey) ||
+      (hidesForeignSessions && !isCreator)
+    ) {
+      return false;
+    }
+    if (resolveSessionVisibility(target.entry) === "draft" && !isCreator) {
+      return event === "session.typing" && canManageSessionSharing(sharing.roleForTarget(target));
+    }
+    return (
+      event !== "session.suggestion" ||
+      authorId === identity.id ||
+      sharing.roleForTarget(target) !== "viewer"
+    );
   });
 }
 
@@ -150,6 +135,7 @@ export function prepareSessionSharing(
     isCreator,
     sessionCap: prepared?.sessionCap,
     entryFilter: createSessionListEntryFilter(params, isCreator, prepared),
+    listVisibility: captureSessionListVisibility(params, prepared),
     roleForTarget,
     authorizeTarget: (target: SessionSharingTarget) =>
       authorizeSessionSharingTarget(
@@ -419,32 +405,43 @@ export function createSessionListEntryFilter(
       entry: Pick<SessionEntry, "createdActor" | "visibility" | "incognito">,
     ) => boolean)
   | undefined {
+  const visibility = resolveSessionListVisibility(params, prepared);
+  if (visibility.kind === "all") {
+    return undefined;
+  }
+  if (visibility.kind === "none") {
+    return () => false;
+  }
+  return createProfileSessionEntryFilter(visibility, isCreator);
+}
+
+function captureSessionListVisibility(
+  params: Pick<SessionSharingRoleParams, "cfg" | "client">,
+  prepared?: { aliases: ReadonlySet<string>; sessionCap: ReturnType<typeof operatorSessionCap> },
+): SessionListVisibility {
+  const visibility = resolveSessionListVisibility(params, prepared);
+  return visibility.kind === "profile"
+    ? { ...visibility, aliases: prepared?.aliases ?? new Set<string>() }
+    : visibility;
+}
+
+function resolveSessionListVisibility(
+  params: Pick<SessionSharingRoleParams, "cfg" | "client">,
+  prepared?: { sessionCap: ReturnType<typeof operatorSessionCap> },
+):
+  | Omit<Extract<SessionListVisibility, { kind: "profile" }>, "aliases">
+  | { kind: "all" }
+  | { kind: "none" } {
   const operatorActor = resolveGatewayOperatorRoleActor(params.client);
   const identity = sharingIdentity(params.client, operatorActor);
   if (isGatewayAdmin(params.client) || (!identity && operatorActor?.kind === "system")) {
-    return undefined;
+    return { kind: "all" };
   }
   if (!identity) {
-    return params.cfg?.gateway?.roles ? () => false : undefined;
+    return { kind: params.cfg?.gateway?.roles ? "none" : "all" };
   }
   const sessionCap = prepared
     ? prepared.sessionCap
     : params.cfg && operatorSessionCap(params.client, params.cfg);
-  return createProfileSessionEntryFilter({ profileId: identity.id, sessionCap }, isCreator);
-}
-
-export function createProfileSessionEntryFilter(
-  params: { profileId: string; sessionCap?: ReturnType<typeof operatorSessionCap> },
-  isCreator?: ReturnType<typeof prepareSessionCreatorProfile>,
-) {
-  // Unprepared filters (notably preview) may survive yields and must read current aliases.
-  const creatorMatches = isCreator ?? ((actor) => isSessionCreatorProfile(actor, params.profileId));
-  return (
-    sessionKey: string | undefined,
-    entry: Pick<SessionEntry, "createdActor" | "visibility" | "incognito">,
-  ) =>
-    entry.incognito !== true &&
-    !isIncognitoSessionKey(sessionKey) &&
-    (creatorMatches(entry.createdActor) ||
-      (params.sessionCap !== "none" && resolveSessionVisibility(entry) !== "draft"));
+  return { kind: "profile", profileId: identity.id, sessionCap };
 }

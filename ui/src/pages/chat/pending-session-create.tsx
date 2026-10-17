@@ -6,8 +6,8 @@ import type { ImageLightboxItem } from "../../components/image-lightbox.types.ts
 import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
 import { t } from "../../lib/reactive/i18n.ts";
 import { parseAgentSessionKey } from "../../lib/sessions/session-key.ts";
+import { defineSolidBridge } from "../../lib/solid-bridge.ts";
 import { generateUUID } from "../../lib/uuid.ts";
-import { defineSolidBridge } from "../../lit/solid-bridge.ts";
 import { CreationComposer } from "../new-session/creation-composer-render.tsx";
 import { NewSessionBody } from "../new-session/draft-body.solid.tsx";
 import { chatStartupStatusLabel } from "./chat-run-startup.ts";
@@ -182,7 +182,6 @@ function PendingSessionCreateContent(props: PendingSessionCreateProps) {
         onOpenImage: openImage,
       },
       creationComposer: composer?.canDisplay() ? composer : undefined,
-      renderRevision: {},
       composer: {
         paneId: composerId,
         sessionKey: props.sessionKey,
@@ -222,19 +221,10 @@ function PendingSessionCreateContent(props: PendingSessionCreateProps) {
                     <Show
                       when={current().creationComposer}
                       keyed
-                      fallback={
-                        <ChatComposer
-                          {...current().composer}
-                          renderRevision={current().renderRevision}
-                        />
-                      }
+                      fallback={<ChatComposer {...current().composer} />}
                     >
                       {(composer) => (
-                        <CreationComposer
-                          composer={composer}
-                          onOpenImage={openImage}
-                          renderRevision={current().renderRevision}
-                        />
+                        <CreationComposer composer={composer} onOpenImage={openImage} />
                       )}
                     </Show>
                   )}

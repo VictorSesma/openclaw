@@ -15,6 +15,7 @@ import { prepareSqliteReadOnlyLocationSync } from "../sqlite-snapshot-source.js"
 import { createSqliteWalCheckpoint } from "../sqlite-wal-checkpoint.js";
 import { WorkerTaskError } from "../worker-task-pool.js";
 import { resolveDatabaseEngineInput } from "./config.js";
+import { getScopedDatabaseEngineSelection } from "./context.js";
 import {
   assertDatabasePortNamespaceOwner,
   databasePortProviders,
@@ -29,6 +30,7 @@ import {
   materializeDatabasePort,
   migrateDatabasePortSource,
   readPostgresPortCapabilities,
+  sqlitePortAllocations,
   type PortDescriptor,
   type PortVerification,
 } from "./port.worker.js";
@@ -55,6 +57,7 @@ export type DatabasePortTask =
       Identity)
   | { operation: "checkpoint"; sourcePath: string };
 export type DatabasePortInspection = Partial<Identity> & {
+  family: string;
   engine: "sqlite" | "postgres";
   version: number;
   descriptorHash: string;
@@ -92,7 +95,10 @@ async function inspectSqliteImage(
     pendingColumns: {},
   };
   if (allowMigration && migrationRequired) {
-    inspectSqlitePortSchema(db, descriptor, pendingColumns);
+    // The family owner validates its historical shape before the private migration.
+    if (!descriptor.migrateSqliteSource) {
+      inspectSqlitePortSchema(db, descriptor, pendingColumns);
+    }
     return { version, migrationRequired };
   }
   const { tables, allocations } = await inspectDatabasePort({ engine: "sqlite", db }, descriptor);
@@ -163,7 +169,19 @@ async function stage(
     refuse("observed unmigrated private source; required migrate phase before staging");
   }
   if (task.sourceVerification) {
-    compare(verification, task.sourceVerification);
+    compare(
+      verification,
+      task.to === "sqlite"
+        ? {
+            ...task.sourceVerification,
+            allocations: sqlitePortAllocations(
+              descriptor,
+              verification.allocations,
+              task.sourceVerification.allocations,
+            ),
+          }
+        : task.sourceVerification,
+    );
   }
   const occupied = await fs.stat(task.targetPath).then(
     () => true,
@@ -249,7 +267,10 @@ async function stage(
   assertCurrent();
   await descriptor.admit?.(
     task.targetPath,
-    task.to === "postgres" ? await resolveDatabaseEngineInput(task.config) : undefined,
+    task.to === "postgres"
+      ? (getScopedDatabaseEngineSelection()?.postgres ??
+          (await resolveDatabaseEngineInput(task.config)))
+      : undefined,
   );
   if (task.to === "sqlite") {
     compare((await inspectSqlite(task.targetPath, descriptor)).verification!, verification);
@@ -333,7 +354,13 @@ async function execute(task: DatabasePortTask, assertCurrent: () => void): Promi
             verification: await inspectPostgres(db, descriptor, engine, false),
           }))
         : source.facts!;
-    return { ...engine, ...facts, descriptorHash, targetVersion: descriptor.version };
+    return {
+      ...engine,
+      ...facts,
+      family: descriptor.id,
+      descriptorHash,
+      targetVersion: descriptor.version,
+    };
   }
   if (task.operation === "migrate" || task.operation === "stage") {
     const verification =

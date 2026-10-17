@@ -20,6 +20,7 @@ import { projectGateway } from "../../lib/reactive/application.ts";
 import { useOptionalApplication } from "../../lib/reactive/context.ts";
 import { projectChannels, projectRuntimeConfig } from "../../lib/reactive/domain-capabilities.ts";
 import { t } from "../../lib/reactive/i18n.ts";
+import { listen } from "../../lib/reactive/listener.ts";
 import { projectSource } from "../../lib/reactive/projection.ts";
 import { resolveScrollBehavior } from "../../lib/scroll-behavior.ts";
 import { importNostrProfile, parseValidationErrors, putNostrProfile } from "./nostr-profile-ops.ts";
@@ -601,7 +602,7 @@ function createChannelsPage(getContext: () => ApplicationContext) {
         editNostrForm((form) => ({ ...form, showAdvanced: !form.showAdvanced })),
     };
   }
-
+  // Rebind Gateway, channel, config, and theme subscriptions together when their context changes.
   createEffect(getContext, (context) =>
     untrack(() => {
       // Subscription callbacks reconcile synchronous owner receipts; their reads do not subscribe.
@@ -640,11 +641,9 @@ function createChannelsPage(getContext: () => ApplicationContext) {
       };
     }),
   );
+  // Scroll the pairing section only after its requested DOM has committed.
   createEffect(pairingScrollPending, afterRender);
-  onSettled(() => {
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
-  });
+  onSettled(() => listen(document, "visibilitychange", handleVisibilityChange));
   onCleanup(() => {
     active = false;
     if (pairingTimer !== null) {

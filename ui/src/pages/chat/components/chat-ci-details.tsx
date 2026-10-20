@@ -1,10 +1,11 @@
-import { For, Show, createEffect, createMemo, createStore } from "solid-js";
+import { For, Show, createStore } from "solid-js";
 import type {
   ControlUiSessionPullRequestCheck,
   ControlUiSessionPullRequestCheckDetails,
   ControlUiSessionPullRequestCheckStep,
 } from "../../../../../src/gateway/control-ui-contract.js";
 import { Icon } from "../../../components/solid/icon.tsx";
+import { StrokeIcon } from "../../../components/solid/stroke-icon.tsx";
 import { registerChatCiEnglish } from "../../../i18n/locales/en-chat-ci.ts";
 import { registerGitHubEnglish } from "../../../i18n/locales/en-github.ts";
 import { formatDurationCompact } from "../../../lib/format-duration.ts";
@@ -61,18 +62,10 @@ function CheckStatus(props: { state: CheckState }) {
       <Show
         when={props.state !== "skipped"}
         fallback={
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
+          <StrokeIcon aria-hidden="true">
             <circle cx="12" cy="12" r="10" />
             <path d="M8 12h8" />
-          </svg>
+          </StrokeIcon>
         }
       >
         <Icon name={CHECK_PRESENTATION[props.state][1]} />
@@ -97,11 +90,9 @@ type DetailsState = {
   retryAt: number;
   expandedJobs: Record<number, boolean>;
 };
+const inputHandlers = new WeakMap<HTMLElement, (key: keyof ChatCiDisclosureProps) => void>();
 
-function createCiDetails(
-  props: ChatCiDisclosureProps,
-  host: SolidBridgeElement<ChatCiDisclosureProps>,
-) {
+function createCiDetails(host: SolidBridgeElement<ChatCiDisclosureProps>) {
   const [state, setState] = createStore<DetailsState>({
     loading: false,
     result: undefined,
@@ -111,60 +102,71 @@ function createCiDetails(
   });
   const connection = createGatewayConnectionLifecycle({ client: null, phase: "stopped" });
   let target = "";
+  let sessionKey = "";
+  let stopGateway: (() => void) | undefined;
   let requestController: AbortController | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let expansionInitialized = false;
   const disclosure = createCiDisclosure(host, handleVisibility, () => {
-    connection.dispose();
-    requestController?.abort();
-    clearTimeout(refreshTimer);
+    inputHandlers.set(host, handleInputsChanged);
+    bindGateway();
+    syncTarget();
+    return () => {
+      inputHandlers.delete(host);
+      stopGateway?.();
+      connection.dispose();
+      requestController?.abort();
+      clearTimeout(refreshTimer);
+    };
   });
 
-  // Rebind Gateway connection notifications and retire requests from the old client.
-  createEffect(
-    () => props.gateway,
-    (gateway) => {
-      connection.transition(gateway?.snapshot ?? { client: null, phase: "stopped" });
-      reset();
-      // Revoke in-flight request scopes on every connection edge, before later acknowledgments.
-      const stop = gateway?.subscribe((snapshot) => {
-        if (connection.transition(snapshot)) {
-          reset();
-          queueMicrotask(() => void load());
-        }
-      });
-      queueMicrotask(() => void load());
-      return stop;
-    },
-  );
-  const targetKey = createMemo(() =>
-    JSON.stringify([
-      props.sessionKey,
-      props.pullRequest?.owner,
-      props.pullRequest?.repo,
-      props.pullRequest?.number,
-      props.pullRequest?.headSha,
-    ]),
-  );
-  // Session and visibility changes control the external checks request and disclosure.
-  createEffect(
-    () => [props.sessionKey, targetKey(), props.presented] as const,
-    ([sessionKey, nextTarget], previous) => {
-      if (target !== nextTarget) {
-        // Head changes refresh the same open monitor; session changes dismiss it.
-        if (previous?.[0] && previous[0] !== sessionKey) {
-          disclosure.close();
-        }
-        target = nextTarget;
+  function bindGateway() {
+    stopGateway?.();
+    const gateway = host.gateway;
+    connection.transition(gateway?.snapshot ?? { client: null, phase: "stopped" });
+    reset();
+    // Revoke in-flight request scopes on every connection edge, before later acknowledgments.
+    stopGateway = gateway?.subscribe((snapshot) => {
+      if (connection.transition(snapshot)) {
         reset();
+        queueMicrotask(() => void load());
       }
+    });
+    queueMicrotask(() => void load());
+  }
+
+  function syncTarget() {
+    const next = JSON.stringify([
+      host.sessionKey,
+      host.pullRequest?.owner,
+      host.pullRequest?.repo,
+      host.pullRequest?.number,
+      host.pullRequest?.headSha,
+    ]);
+    if (target === next) {
+      return false;
+    }
+    // Head changes refresh the same open monitor; session changes dismiss it.
+    if (sessionKey && sessionKey !== host.sessionKey) {
+      disclosure.close();
+    }
+    target = next;
+    sessionKey = host.sessionKey;
+    reset();
+    return true;
+  }
+
+  function handleInputsChanged(key: keyof ChatCiDisclosureProps) {
+    if (key === "gateway") {
+      bindGateway();
+    } else if (key === "presented" || syncTarget()) {
       if (!disclosure.visible()) {
         cancelRequest();
       } else {
         queueMicrotask(handleVisibility);
       }
-    },
-  );
+    }
+  }
 
   function cancelRequest() {
     requestController?.abort();
@@ -304,10 +306,10 @@ function createCiDetails(
 
 export type ChatCiDetailsElement = SolidBridgeElement<ChatCiDisclosureProps>;
 function ChatCiDetailsContent(
-  props: ChatCiDisclosureProps,
+  _props: ChatCiDisclosureProps,
   host: SolidBridgeElement<ChatCiDisclosureProps>,
 ) {
-  const model = createCiDetails(props, host);
+  const model = createCiDetails(host);
   const state = model.state;
   const retryWait = () => Math.max(0, state.retryAt - Date.now());
   const result = () => state.result;
@@ -477,6 +479,7 @@ function ChatCiDetailsContent(
 }
 
 defineSolidBridge<ChatCiDisclosureProps>("openclaw-chat-ci-details", ChatCiDetailsContent, {
+  propertyChanged: (host, key) => inputHandlers.get(host)?.(key),
   properties: {
     gateway: { default: undefined, attribute: false },
     pullRequest: { default: undefined, attribute: false },
